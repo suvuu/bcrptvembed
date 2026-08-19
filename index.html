@@ -2,21 +2,25 @@
 <meta charset="utf-8">
 <title>BCRP TV embed</title>
 <!--
-  Host this anywhere that serves https (GitHub Pages, Cloudflare Pages, your own domain), then put
-  its URL in the Television component's "Embed Page Url" field, with placeholders:
+  Host this over https, then put its URL in the Television component's "Embed Page Url" field:
 
       https://you.example/tv/?id={id}&start={start}&mute={mute}&volume={volume}
 
-  Why it has to exist at all:
+  Why it exists: pointing a browser surface straight at youtube.com/embed makes the embed a
+  TOP-LEVEL document, which YouTube rejects with "Error 153". This page is the origin it wants.
+  It also restores volume control, which Sandbox.WebSurface has no API for at all.
 
-  s&box renders web channels with Sandbox.UI.WebPanel, a browser surface. Pointing that surface
-  straight at https://www.youtube.com/embed/ID makes the embed a TOP-LEVEL document, and YouTube
-  rejects that with "Error 153 - video player configuration error": its embed expects to be inside
-  an iframe on a real origin. This page is that origin.
+  How autoplay is handled, which is the fiddly part:
 
-  It also buys back the two things the raw embed cannot do:
-    - volume, because WebSurface exposes no volume API at all
-    - a start offset applied through the player API, so peers tune in at the same point
+  Browsers only allow autoplay without a user gesture when the video is MUTED, so playback always
+  starts muted. Unmuting afterwards needs a real user activation, and activation is per-document -
+  a click on this page does NOT grant it to YouTube's cross-origin iframe. The click has to land
+  INSIDE the iframe.
+
+  With controls hidden, a click inside the iframe toggles play/pause, so the game's synthetic click
+  pauses the video. That is exactly what onStateChange below listens for: a PAUSED state that we
+  did not ask for means the click landed, the iframe now has activation, so resume and unmute. The
+  viewer sees a single frame of pause.
 -->
 <style>
   html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
@@ -31,17 +35,27 @@
 <div id="msg" hidden></div>
 
 <script>
-  const params   = new URLSearchParams(location.search);
-  const videoId  = (params.get('id') || '').replace(/[^A-Za-z0-9_-]/g, '');
-  const start    = Math.max(0, parseInt(params.get('start') || '0', 10) || 0);
-  const muted    = params.get('mute') === '1';
-  // The game sends 0-100. Default mid-volume so a missing param is never silent-and-confusing.
-  const volume   = Math.min(100, Math.max(0, parseInt(params.get('volume') ?? '55', 10) || 0));
+  const params  = new URLSearchParams(location.search);
+  const videoId = (params.get('id') || '').replace(/[^A-Za-z0-9_-]/g, '');
+  const start   = Math.max(0, parseInt(params.get('start') || '0', 10) || 0);
+  const wantMuted = params.get('mute') === '1';
+  // The game sends 0-100. Default mid-volume so a missing param is never silently dead.
+  const volume  = Math.min(100, Math.max(0, parseInt(params.get('volume') ?? '55', 10) || 0));
+
+  let player = null;
+  let started = false;
 
   function fail(text) {
     const el = document.getElementById('msg');
     el.textContent = text;
     el.hidden = false;
+  }
+
+  function applyAudio() {
+    if (!player) return;
+    if (wantMuted) { player.mute(); return; }
+    player.unMute();
+    player.setVolume(volume);
   }
 
   if (!videoId) {
@@ -54,10 +68,12 @@
   }
 
   window.onYouTubeIframeAPIReady = () => {
-    new YT.Player('player', {
+    player = new YT.Player('player', {
       videoId,
       playerVars: {
         autoplay: 1,
+        // Muted start is the only autoplay a browser will allow unprompted.
+        mute: 1,
         controls: 0,
         disablekb: 1,
         fs: 0,
@@ -65,25 +81,45 @@
         playsinline: 1,
         rel: 0,
         start,
-        // Same-origin check: this page IS the origin, which is the whole point of hosting it.
         origin: location.origin,
       },
       events: {
         onReady: (e) => {
-          // Autoplay policy: a muted start is always permitted, so begin muted and unmute right
-          // after playback has actually begun. Without this some browsers block the play outright.
           e.target.mute();
           e.target.playVideo();
-          if (!muted) {
-            setTimeout(() => { e.target.unMute(); e.target.setVolume(volume); }, 400);
-          }
         },
-        // Loop, so a TV left on a channel keeps showing something.
         onStateChange: (e) => {
-          if (e.data === YT.PlayerState.ENDED) e.target.seekTo(0, true);
+          if (e.data === YT.PlayerState.PLAYING) {
+            started = true;
+            return;
+          }
+
+          // A pause we did not ask for is the game's synthetic click landing in the iframe. That
+          // click is the user activation we needed, so resume and take the audio with us.
+          if (e.data === YT.PlayerState.PAUSED) {
+            e.target.playVideo();
+            applyAudio();
+            return;
+          }
+
+          // Loop, so a TV left on a channel always has something on it.
+          if (e.data === YT.PlayerState.ENDED) {
+            e.target.seekTo(0, true);
+            e.target.playVideo();
+          }
         },
         onError: (e) => fail('YouTube player error ' + e.data),
       },
     });
   };
+
+  // Some environments swallow the first play. Keep asking until it takes, then stop.
+  let attempts = 0;
+  const retry = setInterval(() => {
+    if (started || !player || !player.playVideo || ++attempts > 10) {
+      if (started || attempts > 10) clearInterval(retry);
+      return;
+    }
+    player.playVideo();
+  }, 1000);
 </script>
