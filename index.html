@@ -1,0 +1,89 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>BCRP TV embed</title>
+<!--
+  Host this anywhere that serves https (GitHub Pages, Cloudflare Pages, your own domain), then put
+  its URL in the Television component's "Embed Page Url" field, with placeholders:
+
+      https://you.example/tv/?id={id}&start={start}&mute={mute}&volume={volume}
+
+  Why it has to exist at all:
+
+  s&box renders web channels with Sandbox.UI.WebPanel, a browser surface. Pointing that surface
+  straight at https://www.youtube.com/embed/ID makes the embed a TOP-LEVEL document, and YouTube
+  rejects that with "Error 153 - video player configuration error": its embed expects to be inside
+  an iframe on a real origin. This page is that origin.
+
+  It also buys back the two things the raw embed cannot do:
+    - volume, because WebSurface exposes no volume API at all
+    - a start offset applied through the player API, so peers tune in at the same point
+-->
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  #player { width: 100vw; height: 100vh; border: 0; }
+  #msg {
+    position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+    color: #888; font: 600 18px/1.4 system-ui, sans-serif; text-align: center; padding: 24px;
+  }
+</style>
+
+<div id="player"></div>
+<div id="msg" hidden></div>
+
+<script>
+  const params   = new URLSearchParams(location.search);
+  const videoId  = (params.get('id') || '').replace(/[^A-Za-z0-9_-]/g, '');
+  const start    = Math.max(0, parseInt(params.get('start') || '0', 10) || 0);
+  const muted    = params.get('mute') === '1';
+  // The game sends 0-100. Default mid-volume so a missing param is never silent-and-confusing.
+  const volume   = Math.min(100, Math.max(0, parseInt(params.get('volume') ?? '55', 10) || 0));
+
+  function fail(text) {
+    const el = document.getElementById('msg');
+    el.textContent = text;
+    el.hidden = false;
+  }
+
+  if (!videoId) {
+    fail('No video id. Expected ?id=VIDEO_ID');
+  } else {
+    const tag = document.createElement('script');
+    tag.src = 'https://www.youtube.com/iframe_api';
+    tag.onerror = () => fail('Could not reach the YouTube player API.');
+    document.head.appendChild(tag);
+  }
+
+  window.onYouTubeIframeAPIReady = () => {
+    new YT.Player('player', {
+      videoId,
+      playerVars: {
+        autoplay: 1,
+        controls: 0,
+        disablekb: 1,
+        fs: 0,
+        modestbranding: 1,
+        playsinline: 1,
+        rel: 0,
+        start,
+        // Same-origin check: this page IS the origin, which is the whole point of hosting it.
+        origin: location.origin,
+      },
+      events: {
+        onReady: (e) => {
+          // Autoplay policy: a muted start is always permitted, so begin muted and unmute right
+          // after playback has actually begun. Without this some browsers block the play outright.
+          e.target.mute();
+          e.target.playVideo();
+          if (!muted) {
+            setTimeout(() => { e.target.unMute(); e.target.setVolume(volume); }, 400);
+          }
+        },
+        // Loop, so a TV left on a channel keeps showing something.
+        onStateChange: (e) => {
+          if (e.data === YT.PlayerState.ENDED) e.target.seekTo(0, true);
+        },
+        onError: (e) => fail('YouTube player error ' + e.data),
+      },
+    });
+  };
+</script>
